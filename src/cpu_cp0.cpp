@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -30,7 +30,9 @@ namespace CPU_CP0
     uint32_t _index;
     uint32_t entryLo0;
     uint32_t entryLo1;
+    uint32_t context;
     uint32_t pageMask;
+    uint32_t badVAddr;
     uint32_t count;
     uint32_t entryHi;
     uint32_t compare;
@@ -39,11 +41,13 @@ namespace CPU_CP0
     uint32_t epc;
     uint32_t errorEpc;
 
+    bool irqPending;
     uint32_t startCycles;
     uint32_t endCycles;
 
     void scheduleCount();
     void updateCount();
+    void interrupt();
 
     void tlbr(uint32_t opcode);
     void tlbwi(uint32_t opcode);
@@ -71,7 +75,9 @@ void CPU_CP0::reset()
     _index = 0;
     entryLo0 = 0;
     entryLo1 = 0;
+    context = 0;
     pageMask = 0;
+    badVAddr = 0;
     count = 0;
     entryHi = 0;
     compare = 0;
@@ -79,6 +85,7 @@ void CPU_CP0::reset()
     cause = 0;
     epc = 0;
     errorEpc = 0;
+    irqPending = false;
     endCycles = -1;
     scheduleCount();
 }
@@ -100,9 +107,17 @@ uint32_t CPU_CP0::read(int index)
             // Get the low entry 1 register
             return entryLo1;
 
+        case 4: // Context
+            // Get the context register
+            return context;
+
         case 5: // PageMask
             // Get the page mask register
             return pageMask;
+
+        case 8: // BadVAddr
+            // Get the bad virtual address register
+            return badVAddr;
 
         case 9: // Count
             // Get the count register, as it would be at the current cycle
@@ -156,6 +171,11 @@ void CPU_CP0::write(int index, uint32_t value)
         case 3: // EntryLo1
             // Set the low entry 1 register
             entryLo1 = value & 0x3FFFFFF;
+            return;
+
+        case 4: // Context
+            // Set the context register
+            context = value & 0xFFFFFFF0;
             return;
 
         case 5: // PageMask
@@ -264,27 +284,52 @@ void CPU_CP0::checkInterrupts()
     // Set the external interrupt bit if any MI interrupt is set
     cause = (cause & ~0x400) | ((bool)(MI::interrupt & MI::mask) << 10);
 
-    // Trigger an interrupt if able and an enabled bit is set
-    if (((status & 0x3) == 0x1) && (status & cause & 0xFF00))
-        exception(0);
+    // Schedule an interrupt if able and an enabled bit is set
+    if (((status & 0x3) == 0x1) && (status & cause & 0xFF00) && !irqPending)
+    {
+        Core::schedule(interrupt, 2); // 1 CPU cycle
+        irqPending = true;
+    }
+}
+
+void CPU_CP0::interrupt()
+{
+    // Trigger an interrupt that has been scheduled
+    CPU_CP0::exception(0);
+    irqPending = false;
 }
 
 void CPU_CP0::exception(uint8_t type)
 {
-    // If an exception occurs at a delay slot, execute that first
-    // TODO: handle delay slot exceptions properly
-    if (CPU::nextOpcode != Memory::read<uint32_t>(CPU::programCounter))
-        CPU::runOpcode();
-
     // Update registers for an exception and jump to the handler
+    // TODO: handle nested exceptions
     status |= 0x2; // EXL
-    cause = (cause & ~0x7C) | ((type << 2) & 0x7C);
+    cause = (cause & ~0x8000007C) | ((type << 2) & 0x7C);
     epc = CPU::programCounter - (type ? 4 : 0);
-    CPU::programCounter = ((status & (1 << 22)) ? 0xBFC00200 : 0x80000000) + 0x180 - 4;
+    CPU::programCounter = ((status & (1 << 22)) ? 0xBFC00200 : 0x80000000) - 4;
     CPU::nextOpcode = 0;
+
+    // Adjust the exception vector based on the type
+    if ((type & ~1) != 2) // Not TLB miss
+        CPU::programCounter += 0x180;
+
+    // Return to the preceding branch if the exception occured in a delay slot
+    if (CPU::delaySlot != -1)
+    {
+        epc = CPU::delaySlot - 4;
+        cause |= (1 << 31); // BD
+    }
 
     // Unhalt the CPU if it was idling
     Core::cpuRunning = true;
+}
+
+void CPU_CP0::setTlbAddress(uint32_t address)
+{
+    // Set the address that caused a TLB exception
+    badVAddr = address;
+    entryHi = address & 0xFFFFE000;
+    context = (context & ~0x7FFFF0) | ((address >> 9) & 0x7FFFF0);
 }
 
 bool CPU_CP0::cpUsable(uint8_t cp)

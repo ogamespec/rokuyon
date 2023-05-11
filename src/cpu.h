@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -20,13 +20,14 @@
 #ifndef CPU_H
 #define CPU_H
 
-#include <string>
+#include <cstdint>
 
 namespace CPU
 {
     extern uint64_t *registersW[32];
     extern uint32_t programCounter;
     extern uint32_t nextOpcode;
+    extern uint32_t delaySlot;
 
     void reset();
     void runOpcode();

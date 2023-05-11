@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -28,6 +28,7 @@
 #include "../ai.h"
 #include "../core.h"
 #include "../pif.h"
+#include "../settings.h"
 #include "../vi.h"
 
 AudioOutBuffer audioBuffers[2];
@@ -93,6 +94,45 @@ void stopCore()
     }
 }
 
+void settingsMenu()
+{
+    const std::vector<std::string> toggle = { "Off", "On" };
+    size_t index = 0;
+
+    while (true)
+    {
+        // Make a list of settings and current values
+        std::vector<ListItem> settings =
+        {
+            ListItem("FPS Limiter", toggle[Settings::fpsLimiter]),
+            ListItem("Threaded RDP", toggle[Settings::threadedRdp]),
+            ListItem("Texture Filter", toggle[Settings::texFilter])
+        };
+
+        // Create the settings menu
+        Selection menu = SwitchUI::menu("Settings", &settings, index);
+        index = menu.index;
+
+        // Handle menu input
+        if (menu.pressed & HidNpadButton_A)
+        {
+            // Change the chosen setting to its next value
+            switch (index)
+            {
+                case 0: Settings::fpsLimiter = !Settings::fpsLimiter; break;
+                case 1: Settings::threadedRdp = !Settings::threadedRdp; break;
+                case 2: Settings::texFilter = !Settings::texFilter; break;
+            }
+        }
+        else
+        {
+            // Close the settings menu
+            Settings::save();
+            return;
+        }
+    }
+}
+
 void fileBrowser()
 {
     size_t index = 0;
@@ -122,7 +162,7 @@ void fileBrowser()
         sort(files.begin(), files.end());
 
         // Create the file browser menu
-        Selection menu = SwitchUI::menu("rokuyon", &files, index, "", "Exit");
+        Selection menu = SwitchUI::menu("rokuyon", &files, index, "Settings", "Exit");
         index = menu.index;
 
         // Handle menu input
@@ -153,6 +193,11 @@ void fileBrowser()
                 path = path.substr(0, path.rfind("/"));
                 index = 0;
             }
+        }
+        else if (menu.pressed & HidNpadButton_X)
+        {
+            // Open the settings menu
+            settingsMenu();
         }
         else
         {
@@ -222,6 +267,7 @@ void pauseMenu()
         ListItem("Resume"),
         ListItem("Restart"),
         ListItem("Change Save Type"),
+        ListItem("Settings"),
         ListItem("File Browser")
     };
 
@@ -255,7 +301,12 @@ void pauseMenu()
                         fileBrowser();
                     return;
 
-                case 3: // File Browser
+                case 3: // Settings
+                    // Open the settings menu
+                    settingsMenu();
+                    break;
+
+                case 4: // File Browser
                     // Open the file browser
                     fileBrowser();
                     return;
@@ -280,6 +331,10 @@ int main()
     // Initialize the UI and lock exiting until cleanup
     appletLockExit();
     SwitchUI::initialize();
+
+    // Load settings or create them if they don't exist
+    if (!Settings::load())
+        Settings::save();
 
     // Initialize audio output
     audoutInitialize();
@@ -341,6 +396,7 @@ int main()
             SwitchUI::drawImage(fb->data, fb->width, fb->height, 160, 0, 960, 720, true, 0);
             if (showFps) SwitchUI::drawString(std::to_string(Core::fps) + " FPS", 5, 0, 48, Color(255, 255, 255));
             SwitchUI::update();
+            delete fb;
         }
 
         // Toggle showing FPS or open the pause menu if hotkeys are pressed

@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -22,7 +22,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <string>
 
 namespace PIF
 {

@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -24,8 +24,13 @@
 
 #include "ry_frame.h"
 
+#define MAX_KEYS 19
+
 class ryApp: public wxApp
 {
+    public:
+        static int keyBinds[MAX_KEYS];
+
     private:
         ryFrame *frame;
         wxTimer *timer;

@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -19,11 +19,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "rdp.h"
 #include "log.h"
 #include "memory.h"
 #include "mi.h"
+#include "settings.h"
 
 enum Format
 {
@@ -62,6 +66,10 @@ namespace RDP
     extern void (*commands[])();
     extern uint8_t paramCounts[];
 
+    std::thread *thread;
+    std::mutex mutex;
+    bool running;
+
     uint8_t tmem[0x1000]; // 4KB TMEM
     uint32_t startAddr;
     uint32_t endAddr;
@@ -70,13 +78,19 @@ namespace RDP
     uint32_t addrBase;
     uint32_t addrMask;
     uint8_t paramCount;
-    uint64_t opcode[22];
+    std::vector<uint64_t> opcode;
 
     CycleType cycleType;
+    bool texFilter;
     uint8_t blendA[2];
     uint8_t blendB[2];
     uint8_t blendC[2];
     uint8_t blendD[2];
+    bool alphaMultiply;
+    uint8_t zMode;
+    bool zUpdate;
+    bool zCompare;
+    bool alphaCompare;
 
     uint32_t texAddress;
     uint16_t texWidth;
@@ -119,11 +133,15 @@ namespace RDP
     uint16_t RGBA32toRGBA16(uint32_t color);
     uint32_t colorToAlpha(uint32_t color);
 
-    uint32_t getTexel(Tile &tile, int s, int t);
+    uint32_t getTexel(Tile &tile, int s, int t, bool rect = false);
+    uint32_t getRawTexel(Tile &tile, int s, int t);
     bool blendPixel(bool cycle, uint32_t &color);
     bool drawPixel(int x, int y);
+    bool testDepth(int x, int y, int z);
 
+    void runThreaded();
     void runCommands();
+
     void triangle();
     void triDepth();
     void triTexture();
@@ -197,11 +215,18 @@ void RDP::reset()
     addrBase = 0xA0000000;
     addrMask = 0x3FFFFF;
     paramCount = 0;
+    opcode.clear();
     cycleType = ONE_CYCLE;
+    texFilter = false;
     blendA[0] = blendA[1] = 0;
     blendB[0] = blendB[1] = 0;
     blendC[0] = blendC[1] = 0;
     blendD[0] = blendD[1] = 0;
+    alphaMultiply = false;
+    zMode = 0;
+    zUpdate = false;
+    zCompare = false;
+    alphaCompare = false;
     texAddress = 0xA0000000;
     texWidth = 0;
     texFormat = RGBA4;
@@ -337,12 +362,50 @@ inline uint32_t RDP::colorToAlpha(uint32_t color)
     return (a << 24) | (a << 16) | (a << 8) | a;
 }
 
-uint32_t RDP::getTexel(Tile &tile, int s, int t)
+uint32_t RDP::getTexel(Tile &tile, int s, int t, bool rect)
 {
     // Offset the texture coordinates relative to the tile
-    s = (s - tile.sBase) >> 5;
-    t = (t - tile.tBase) >> 5;
+    s -= tile.sBase;
+    t -= tile.tBase;
 
+    // Fall back to nearest sampling when appropriate
+    if (!Settings::texFilter || !texFilter || cycleType >= COPY_MODE)
+        return getRawTexel(tile, s >> 5, t >> 5);
+
+    // Subtract 0.5 from triangle texture coordinates
+    // TODO: verify rectangle behavior
+    if (!rect)
+    {
+        s -= 0x10;
+        t -= 0x10;
+    }
+
+    // Load 3 texels for blending based on if the point is above or below the diagonal
+    bool c = ((s & 0x1F) + (t & 0x1F) > 0x1F); // Below
+    uint32_t col1 = getRawTexel(tile, (s >> 5) + c, (t >> 5) + c);
+    uint32_t col2 = getRawTexel(tile, (s >> 5) + 0, (t >> 5) + 1);
+    uint32_t col3 = getRawTexel(tile, (s >> 5) + 1, (t >> 5) + 0);
+
+    // Calculate weights for each texel
+    int v1x = (0 - c) << 5, v1y = (1 - c) << 5;
+    int v2x = (1 - c) << 5, v2y = (0 - c) << 5;
+    int v3x = (s & 0x1F) - (c << 5);
+    int v3y = (t & 0x1F) - (c << 5);
+    int den = (v1x * v2y - v2x * v1y) >> 5;
+    int l2 = abs((v3x * v2y - v2x * v3y) / den);
+    int l3 = abs((v1x * v3y - v3x * v1y) / den);
+    int l1 = 0x20 - l2 - l3;
+
+    // Blend each channel of the output filtered texel
+    uint8_t r = (((col1 >> 24) & 0xFF) * l1 + ((col2 >> 24) & 0xFF) * l2 + ((col3 >> 24) & 0xFF) * l3) >> 5;
+    uint8_t g = (((col1 >> 16) & 0xFF) * l1 + ((col2 >> 16) & 0xFF) * l2 + ((col3 >> 16) & 0xFF) * l3) >> 5;
+    uint8_t b = (((col1 >>  8) & 0xFF) * l1 + ((col2 >>  8) & 0xFF) * l2 + ((col3 >>  8) & 0xFF) * l3) >> 5;
+    uint8_t a = (((col1 >>  0) & 0xFF) * l1 + ((col2 >>  0) & 0xFF) * l2 + ((col3 >>  0) & 0xFF) * l3) >> 5;
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+uint32_t RDP::getRawTexel(Tile &tile, int s, int t)
+{
     // Clamp, mirror, or mask the S-coordinate based on tile settings
     if (tile.sClamp)
         s = std::max<int>(std::min<int>(s, tile.sMask), 0);
@@ -364,14 +427,16 @@ uint32_t RDP::getTexel(Tile &tile, int s, int t)
     {
         case RGBA16:
         {
-            // Convert an RGBA16 texel to RGBA32
+            // Convert an RGBA16 texel to RGBA32, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + (s * 2) / tile.width) & 0x1) << 1) : 0;
             uint8_t *value = &tmem[(tile.address + t * tile.width + s * 2) & 0xFFE];
             return RGBA16toRGBA32((value[0] << 8) | value[1]);
         }
 
         case RGBA32:
         {
-            // Read an RGBA32 texel, split across high and low banks
+            // Read an RGBA32 texel split across high and low banks, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + (s * 2) / tile.width) & 0x1) << 1) : 0;
             uint8_t *valueL = &tmem[(tile.address + 0x000 + t * tile.width + s * 2) & 0xFFE];
             uint8_t *valueH = &tmem[(tile.address + 0x800 + t * tile.width + s * 2) & 0xFFE];
             return (valueH[0] << 24) | (valueH[1] << 16) | (valueL[0] << 8) | valueL[1];
@@ -379,23 +444,26 @@ uint32_t RDP::getTexel(Tile &tile, int s, int t)
 
         case CI4:
         {
-            // Convert a CI4 texel to RGBA32, using a TLUT in the high banks
+            // Convert a CI4 texel to RGBA32 using a TLUT in the high banks, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + (s / 2) / tile.width) & 0x1) << 3) : 0;
             uint8_t index = (tmem[(tile.address + t * tile.width + s / 2) & 0xFFF] >> (~s & 1) * 4) & 0xF;
-            uint8_t *value = &tmem[(tile.address + 0x800 + (tile.palette + index) * 2) & 0xFFE];
+            uint8_t *value = &tmem[(0x800 + (tile.palette + index) * 8) & 0xFF8];
             return RGBA16toRGBA32((value[0] << 8) | value[1]);
         }
 
         case CI8:
         {
-            // Convert a CI8 texel to RGBA32, using a TLUT in the high banks
+            // Convert a CI8 texel to RGBA32 using a TLUT in the high banks, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + s / tile.width) & 0x1) << 2) : 0;
             uint8_t index = tmem[(tile.address + t * tile.width + s) & 0xFFF];
-            uint8_t *value = &tmem[(tile.address + 0x800 + index * 2) & 0xFFE];
+            uint8_t *value = &tmem[(0x800 + index * 8) & 0xFF8];
             return RGBA16toRGBA32((value[0] << 8) | value[1]);
         }
 
         case IA4:
         {
-            // Convert an IA4 texel to RGBA32
+            // Convert an IA4 texel to RGBA32, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + (s / 2) / tile.width) & 0x1) << 3) : 0;
             uint8_t value = tmem[(tile.address + t * tile.width + s / 2) & 0xFFF] >> (~s & 1) * 4;
             uint8_t i = ((value << 4) & 0xE0) | ((value << 1) & 0x1C) | ((value >> 2) & 0x3);
             uint8_t a = (value & 0x1) ? 0xFF : 0x0;
@@ -404,7 +472,8 @@ uint32_t RDP::getTexel(Tile &tile, int s, int t)
 
         case IA8:
         {
-            // Convert an IA8 texel to RGBA32
+            // Convert an IA8 texel to RGBA32, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + s / tile.width) & 0x1) << 2) : 0;
             uint8_t value = tmem[(tile.address + t * tile.width + s) & 0xFFF];
             uint8_t i = (value & 0xF0) | (value >> 4);
             uint8_t a = (value & 0x0F) | (value << 4);
@@ -413,7 +482,8 @@ uint32_t RDP::getTexel(Tile &tile, int s, int t)
 
         case IA16:
         {
-            // Convert an IA16 texel to RGBA32
+            // Convert an IA16 texel to RGBA32, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + (s * 2) / tile.width) & 0x1) << 1) : 0;
             uint8_t *value = &tmem[(tile.address + t * tile.width + s * 2) & 0xFFE];
             uint8_t i = value[0];
             uint8_t a = value[1];
@@ -422,7 +492,8 @@ uint32_t RDP::getTexel(Tile &tile, int s, int t)
 
         case I4:
         {
-            // Convert an I4 texel to RGBA32
+            // Convert an I4 texel to RGBA32, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + (s / 2) / tile.width) & 0x1) << 3) : 0;
             uint8_t value = tmem[(tile.address + t * tile.width + s / 2) & 0xFFF] >> (~s & 1) * 4;
             uint8_t i = (value << 4) | (value & 0xF);
             return (i << 24) | (i << 16) | (i << 8) | i;
@@ -430,7 +501,8 @@ uint32_t RDP::getTexel(Tile &tile, int s, int t)
 
         case I8:
         {
-            // Convert an I8 texel to RGBA32
+            // Convert an I8 texel to RGBA32, swapping 32-bit words on odd lines
+            s ^= tile.width ? (((t + s / tile.width) & 0x1) << 2) : 0;
             uint8_t i = tmem[(tile.address + t * tile.width + s) & 0xFFF];
             return (i << 24) | (i << 16) | (i << 8) | i;
         }
@@ -510,6 +582,11 @@ bool RDP::drawPixel(int x, int y)
             combColor = (r << 24) | (g << 16) | (b << 8) | a;
             pixelAlpha = combAlpha = colorToAlpha(combColor);
 
+            // Coverage isn't implemented yet, but pixels with coverage 0 seem to be unconditionally skipped
+            // For now, at least skip pixels where coverage is multiplied by alpha 0
+            if (alphaMultiply && !pixelAlpha)
+                return false;
+
             if (colorFormat == RGBA16)
             {
                 // Blend the pixel with the previous RGBA16 pixel in the color buffer
@@ -543,6 +620,11 @@ bool RDP::drawPixel(int x, int y)
             combColor = (r << 24) | (g << 16) | (b << 8) | a;
             pixelAlpha = combAlpha = colorToAlpha(combColor);
 
+            // Coverage isn't implemented yet, but pixels with coverage 0 seem to be unconditionally skipped
+            // For now, at least skip pixels where coverage is multiplied by alpha 0
+            if (alphaMultiply && !pixelAlpha)
+                return false;
+
             // Blend the pixel with the previous pixel in the color buffer
             if (colorFormat == RGBA16)
                 memColor = RGBA16toRGBA32(Memory::read<uint16_t>(colorAddress + (y * colorWidth + x) * 2)) & ~0xFF;
@@ -572,16 +654,16 @@ bool RDP::drawPixel(int x, int y)
         }
 
         case COPY_MODE:
+            // Skip transparent pixels if alpha compare is enabled
+            if (alphaCompare && !(texelColor & 0xFF))
+                return false;
+
             // Copy a texel directly to the color buffer
-            if (texelColor & 0xFF)
-            {
-                if (colorFormat == RGBA16)
-                    Memory::write<uint16_t>(colorAddress + (y * colorWidth + x) * 2, RGBA32toRGBA16(texelColor));
-                else
-                    Memory::write<uint32_t>(colorAddress + (y * colorWidth + x) * 4, texelColor);
-                return true;
-            }
-            return false;
+            if (colorFormat == RGBA16)
+                Memory::write<uint16_t>(colorAddress + (y * colorWidth + x) * 2, RGBA32toRGBA16(texelColor));
+            else
+                Memory::write<uint32_t>(colorAddress + (y * colorWidth + x) * 4, texelColor);
+            return true;
 
         case FILL_MODE:
             // Copy the fill color directly to the color buffer
@@ -595,24 +677,101 @@ bool RDP::drawPixel(int x, int y)
     return false;
 }
 
+bool RDP::testDepth(int x, int y, int z)
+{
+    // Read the existing depth value from memory
+    int m = Memory::read<uint16_t>(zAddress + (y * colorWidth + x) * 2);
+
+    // Perform a depth test based on the current mode
+    switch (zMode)
+    {
+        case 3: // Decal
+            // TODO: verify this; it's just a guess
+            return m > z - 0x20 && m < z + 0x20;
+
+        default: // TODO: other modes
+            return m > z;
+    }
+}
+
+void RDP::finishThread()
+{
+    // Stop the thread if it was running
+    if (running)
+    {
+        running = false;
+        thread->join();
+        delete thread;
+    }
+}
+
+void RDP::runThreaded()
+{
+    while (true)
+    {
+        // Parse the next command if one is queued
+        mutex.lock();
+        uint8_t op = opcode.empty() ? 0 : ((opcode[0] >> 56) & 0x3F);
+        uint8_t count = paramCounts[op];
+
+        if (opcode.size() >= count)
+        {
+            // Execute a command once all of its parameters have been queued
+            mutex.unlock();
+            (*commands[op])();
+            mutex.lock();
+            opcode.erase(opcode.begin(), opcode.begin() + count);
+            mutex.unlock();
+        }
+        else
+        {
+            // If requested, stop running when the queue is empty
+            mutex.unlock();
+            if (!running) return;
+            std::this_thread::yield();
+        }
+    }
+}
+
 void RDP::runCommands()
 {
+    // Start the thread if enabled and not running
+    if (Settings::threadedRdp && !running)
+    {
+        running = true;
+        thread = new std::thread(runThreaded);
+    }
+
+    mutex.lock();
+
     // Process RDP commands until the end address is reached
     while (startAddr < endAddr)
     {
         // Add a parameter to the buffer
-        opcode[paramCount++] = Memory::read<uint64_t>(addrBase + (startAddr & addrMask));
+        opcode.push_back(Memory::read<uint64_t>(addrBase + (startAddr & addrMask)));
+        paramCount++;
 
         // Execute a command once all of its parameters have been received
-        if (paramCount >= paramCounts[(opcode[0] >> 56) & 0x3F])
+        // When threaded, only run sync commands here; the rest will run on the thread
+        uint8_t op = (opcode[opcode.size() - paramCount] >> 56) & 0x3F;
+        if (paramCount >= paramCounts[op])
         {
-            (*commands[(opcode[0] >> 56) & 0x3F])();
             paramCount = 0;
+            if (!running || op == 0x29) // Sync Full
+            {
+                mutex.unlock();
+                finishThread();
+                mutex.lock();
+                (*commands[op])();
+                opcode.clear();
+            }
         }
 
         // Move to the next parameter
         startAddr += 8;
     }
+
+    mutex.unlock();
 }
 
 void RDP::triangle()
@@ -684,10 +843,10 @@ void RDP::triDepth()
 
             // Draw a pixel if within scissor bounds and the depth test passes
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2 &&
-                Memory::read<uint16_t>(zAddress + (y * colorWidth + x) * 2) > z)
+                (!zCompare || testDepth(x, y, z)))
             {
                 // Update the Z buffer if a pixel is drawn
-                if (drawPixel(x, y))
+                if (drawPixel(x, y) && zUpdate)
                     Memory::write<uint16_t>(zAddress + (y * colorWidth + x) * 2, z);
             }
 
@@ -723,6 +882,7 @@ void RDP::triTexture()
     int32_t dwde = (((opcode[8] >> 16) & 0xFFFF) << 16) | ((opcode[10] >> 16) & 0xFFFF);
 
     // Draw a triangle from top to bottom
+    // This differs slightly from others as a hack for sodium64's renderer
     for (int y = y1; y < y3; y++)
     {
         // Get the X-bounds of the triangle on the current line
@@ -733,12 +893,12 @@ void RDP::triTexture()
         int inc = (xa < xb) ? 1 : -1;
 
         // Get the interpolated values at the start of the line
-        int32_t sa = (s1 += dsde);
-        int32_t ta = (t1 += dtde);
-        int32_t wa = (w1 += dwde);
+        int32_t sa = s1; s1 += dsde;
+        int32_t ta = t1; t1 += dtde;
+        int32_t wa = w1; w1 += dwde;
 
         // Draw a line of the triangle
-        for (int x = xa; x != xb + inc; x += inc)
+        for (int x = xa; x != xb; x += inc)
         {
             // Draw a pixel if it's within scissor bounds
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2)
@@ -815,7 +975,7 @@ void RDP::triDepthTex()
 
             // Draw a pixel if within scissor bounds and the depth test passes
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2 &&
-                Memory::read<uint16_t>(zAddress + (y * colorWidth + x) * 2) > z)
+                (!zCompare || testDepth(x, y, z)))
             {
                 // Update the texel color for the current pixel, with perspective correction
                 if (wa >> 15)
@@ -825,7 +985,7 @@ void RDP::triDepthTex()
                 }
 
                 // Update the Z buffer if a pixel is drawn
-                if (drawPixel(x, y))
+                if (drawPixel(x, y) && zUpdate)
                     Memory::write<uint16_t>(zAddress + (y * colorWidth + x) * 2, z);
             }
 
@@ -888,10 +1048,10 @@ void RDP::triShade()
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2)
             {
                 // Update the shade color for the current pixel
-                uint8_t r = ((ra >> 16) & 0xFF);
-                uint8_t g = ((ga >> 16) & 0xFF);
-                uint8_t b = ((ba >> 16) & 0xFF);
-                uint8_t a = ((aa >> 16) & 0xFF);
+                uint8_t r = std::max(0x00, std::min(0xFF, ra >> 16));
+                uint8_t g = std::max(0x00, std::min(0xFF, ga >> 16));
+                uint8_t b = std::max(0x00, std::min(0xFF, ba >> 16));
+                uint8_t a = std::max(0x00, std::min(0xFF, aa >> 16));
                 shadeColor = (r << 24) | (g << 16) | (b << 8) | a;
                 shadeAlpha = colorToAlpha(shadeColor);
 
@@ -964,18 +1124,18 @@ void RDP::triDepthSha()
 
             // Draw a pixel if within scissor bounds and the depth test passes
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2 &&
-                Memory::read<uint16_t>(zAddress + (y * colorWidth + x) * 2) > z)
+                (!zCompare || testDepth(x, y, z)))
             {
                 // Update the shade color for the current pixel
-                uint8_t r = ((ra >> 16) & 0xFF);
-                uint8_t g = ((ga >> 16) & 0xFF);
-                uint8_t b = ((ba >> 16) & 0xFF);
-                uint8_t a = ((aa >> 16) & 0xFF);
+                uint8_t r = std::max(0x00, std::min(0xFF, ra >> 16));
+                uint8_t g = std::max(0x00, std::min(0xFF, ga >> 16));
+                uint8_t b = std::max(0x00, std::min(0xFF, ba >> 16));
+                uint8_t a = std::max(0x00, std::min(0xFF, aa >> 16));
                 shadeColor = (r << 24) | (g << 16) | (b << 8) | a;
                 shadeAlpha = colorToAlpha(shadeColor);
 
                 // Update the Z buffer if a pixel is drawn
-                if (drawPixel(x, y))
+                if (drawPixel(x, y) && zUpdate)
                     Memory::write<uint16_t>(zAddress + (y * colorWidth + x) * 2, z);
             }
 
@@ -1054,10 +1214,10 @@ void RDP::triShadeTex()
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2)
             {
                 // Update the shade color for the current pixel
-                uint8_t r = ((ra >> 16) & 0xFF);
-                uint8_t g = ((ga >> 16) & 0xFF);
-                uint8_t b = ((ba >> 16) & 0xFF);
-                uint8_t a = ((aa >> 16) & 0xFF);
+                uint8_t r = std::max(0x00, std::min(0xFF, ra >> 16));
+                uint8_t g = std::max(0x00, std::min(0xFF, ga >> 16));
+                uint8_t b = std::max(0x00, std::min(0xFF, ba >> 16));
+                uint8_t a = std::max(0x00, std::min(0xFF, aa >> 16));
                 shadeColor = (r << 24) | (g << 16) | (b << 8) | a;
                 shadeAlpha = colorToAlpha(shadeColor);
 
@@ -1155,13 +1315,13 @@ void RDP::triDepShaTex()
 
             // Draw a pixel if within scissor bounds and the depth test passes
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2 &&
-                Memory::read<uint16_t>(zAddress + (y * colorWidth + x) * 2) > z)
+                (!zCompare || testDepth(x, y, z)))
             {
                 // Update the shade color for the current pixel
-                uint8_t r = ((ra >> 16) & 0xFF);
-                uint8_t g = ((ga >> 16) & 0xFF);
-                uint8_t b = ((ba >> 16) & 0xFF);
-                uint8_t a = ((aa >> 16) & 0xFF);
+                uint8_t r = std::max(0x00, std::min(0xFF, ra >> 16));
+                uint8_t g = std::max(0x00, std::min(0xFF, ga >> 16));
+                uint8_t b = std::max(0x00, std::min(0xFF, ba >> 16));
+                uint8_t a = std::max(0x00, std::min(0xFF, aa >> 16));
                 shadeColor = (r << 24) | (g << 16) | (b << 8) | a;
                 shadeAlpha = colorToAlpha(shadeColor);
 
@@ -1173,7 +1333,7 @@ void RDP::triDepShaTex()
                 }
 
                 // Update the Z buffer if a pixel is drawn
-                if (drawPixel(x, y))
+                if (drawPixel(x, y) && zUpdate)
                     Memory::write<uint16_t>(zAddress + (y * colorWidth + x) * 2, z);
             }
 
@@ -1220,7 +1380,7 @@ void RDP::texRectangle()
             // Draw a pixel if it's within scissor bounds
             if (x >= scissorX1 && x < scissorX2 && y >= scissorY1 && y < scissorY2)
             {
-                texelColor = getTexel(tile, s >> 5, t >> 5);
+                texelColor = getTexel(tile, s >> 5, t >> 5, true);
                 texelAlpha = colorToAlpha(texelColor);
                 drawPixel(x, y);
             }
@@ -1246,9 +1406,10 @@ void RDP::setScissor()
 
 void RDP::setOtherModes()
 {
-    // Set the cycle type and blend inputs
+    // Set various rendering parameters
     // TODO: actually use the other bits
     cycleType = (CycleType)((opcode[0] >> 52) & 0x3);
+    texFilter = (opcode[0] >> 45) & 0x1;
     blendA[0] = (opcode[0] >> 30) & 0x3;
     blendA[1] = (opcode[0] >> 28) & 0x3;
     blendB[0] = (opcode[0] >> 26) & 0x3;
@@ -1257,6 +1418,11 @@ void RDP::setOtherModes()
     blendC[1] = (opcode[0] >> 20) & 0x3;
     blendD[0] = (opcode[0] >> 18) & 0x3;
     blendD[1] = (opcode[0] >> 16) & 0x3;
+    alphaMultiply = (opcode[0] >> 12) & 0x1;
+    zMode = (opcode[0] >> 10) & 0x3;
+    zUpdate = (opcode[0] >> 5) & 0x1;
+    zCompare = (opcode[0] >> 4) & 0x1;
+    alphaCompare = (opcode[0] >> 0) & 0x1;
 }
 
 void RDP::loadTlut()
@@ -1267,10 +1433,10 @@ void RDP::loadTlut()
     uint16_t indexH = ((opcode[0] >> 12) & 0xFFF) >> 1;
 
     // Copy 16-bit texture lookup values into TMEM
-    for (int i = indexL; i < indexH; i += 2)
+    for (int i = indexL; i <= indexH; i += 2)
     {
         uint16_t src = Memory::read<uint16_t>(texAddress + i);
-        uint8_t *dst = &tmem[(tile.address + i) & 0xFFE];
+        uint8_t *dst = &tmem[(tile.address + i * 4) & 0xFF8];
         dst[0] = src >> 8;
         dst[1] = src >> 0;
     }
@@ -1288,22 +1454,27 @@ void RDP::setTileSize()
 void RDP::loadBlock()
 {
     // Decode the operands
-    // TODO: actually use the other bits
     Tile &tile = tiles[(opcode[0] >> 24) & 0x7];
     uint16_t count = ((opcode[0] >> 12) & 0xFFF);
+    uint16_t dxt = (opcode[0] & 0xFFF);
 
     // Adjust the byte count based on the texel size
     count = (count << 2) >> (~texFormat & 0x3);
 
-    if ((texFormat & 0x3) == 0x3)
+    uint16_t d = 0;
+    bool odd = false;
+
+    // Copy texture data from the texture buffer to TMEM
+    if ((texFormat & 0x3) == 0x3) // 32-bit
     {
-        // Copy texture data from the texture buffer to TMEM, 8 bytes at a time, split across high and low banks
         for (int i = 0; i <= count; i += 8)
         {
-            uint64_t src = Memory::read<uint64_t>(texAddress + i);
+            // Read 8 bytes of texture data, swapping the 32-bit halves on odd lines
+            uint64_t src = Memory::read<uint64_t>(texAddress + (i ^ (odd << 3)));
+
+            // Write 8 bytes of texture data to TMEM, split across high and low banks
             uint8_t *dstL = &tmem[(tile.address + 0x000 + i / 2) & 0xFFC];
             uint8_t *dstH = &tmem[(tile.address + 0x800 + i / 2) & 0xFFC];
-
             for (int j = 0; j < 4; j += 2)
             {
                 dstH[j + 0] = src >> (56 - j * 16);
@@ -1311,18 +1482,30 @@ void RDP::loadBlock()
                 dstL[j + 0] = src >> (40 - j * 16);
                 dstL[j + 1] = src >> (32 - j * 16);
             }
+
+            // Move to the next line when the counter overflows
+            uint16_t d2 = d;
+            if (((d += dxt) ^ d2) & 0x800)
+                odd = !odd;
         }
     }
     else
     {
-        // Copy texture data from the texture buffer to TMEM, 8 bytes at a time
         for (int i = 0; i <= count; i += 8)
         {
+            // Read 8 bytes of texture data, swapping the 32-bit halves on odd lines
             uint64_t src = Memory::read<uint64_t>(texAddress + i);
-            uint8_t *dst = &tmem[(tile.address + i) & 0xFF8];
+            if (odd) src = (src >> 32) | (src << 32);
 
+            // Copy 8 bytes of texture data to TMEM
+            uint8_t *dst = &tmem[(tile.address + i) & 0xFF8];
             for (int j = 0; j < 8; j++)
                 dst[j] = src >> (7 - j) * 8;
+
+            // Move to the next line when the counter overflows
+            uint16_t d2 = d;
+            if (((d += dxt) ^ d2) & 0x800)
+                odd = !odd;
         }
     }
 }
@@ -1352,27 +1535,34 @@ void RDP::loadTile()
         case 0x0: // 4-bit
             // Cut out a 4-bit texture from the texture buffer and copy it to TMEM
             for (int t = t1; t <= t2; t++)
+            {
+                int mask = ((t - t1) & 0x1) << 2; // Swap 32-bit words on odd lines
                 for (int s = s1; s <= s2; s += 2)
-                    tmem[(tile.address + (t - t1) * tile.width + (s - s1) / 2) & 0xFFF] =
+                    tmem[((tile.address + (t - t1) * tile.width + (s - s1) / 2) ^ mask) & 0xFFF] =
                         Memory::read<uint8_t>(texAddress + (t * texWidth + s) / 2);
+            }
             return;
 
         case 0x1: // 8-bit
             // Cut out an 8-bit texture from the texture buffer and copy it to TMEM
             for (int t = t1; t <= t2; t++)
+            {
+                int mask = ((t - t1) & 0x1) << 2; // Swap 32-bit words on odd lines
                 for (int s = s1; s <= s2; s++)
-                    tmem[(tile.address + (t - t1) * tile.width + (s - s1)) & 0xFFF] =
+                    tmem[((tile.address + (t - t1) * tile.width + (s - s1)) ^ mask) & 0xFFF] =
                         Memory::read<uint8_t>(texAddress + t * texWidth + s);
+            }
             return;
 
         case 0x2: // 16-bit
             // Cut out a 16-bit texture from the texture buffer and copy it to TMEM
             for (int t = t1; t <= t2; t++)
             {
+                int mask = ((t - t1) & 0x1) << 2; // Swap 32-bit words on odd lines
                 for (int s = s1; s <= s2; s++)
                 {
                     uint16_t src = Memory::read<uint16_t>(texAddress + (t * texWidth + s) * 2);
-                    uint8_t *dst = &tmem[(tile.address + (t - t1) * tile.width + (s - s1) * 2) & 0xFFE];
+                    uint8_t *dst = &tmem[((tile.address + (t - t1) * tile.width + (s - s1) * 2) ^ mask) & 0xFFE];
                     dst[0] = src >> 8;
                     dst[1] = src >> 0;
                 }
@@ -1383,11 +1573,12 @@ void RDP::loadTile()
             // Cut out a 32-bit texture from the texture buffer and copy it to TMEM, split across high and low banks
             for (int t = t1; t <= t2; t++)
             {
+                int mask = ((t - t1) & 0x1) << 2; // Swap 32-bit words on odd lines
                 for (int s = s1; s <= s2; s++)
                 {
                     uint32_t src = Memory::read<uint32_t>(texAddress + (t * texWidth + s) * 4);
-                    uint8_t *dstL = &tmem[(tile.address + 0x000 + (t - t1) * tile.width + (s - s1) * 2) & 0xFFE];
-                    uint8_t *dstH = &tmem[(tile.address + 0x800 + (t - t1) * tile.width + (s - s1) * 2) & 0xFFE];
+                    uint8_t *dstL = &tmem[((tile.address + 0x000 + (t - t1) * tile.width + (s - s1) * 2) ^ mask) & 0xFFE];
+                    uint8_t *dstH = &tmem[((tile.address + 0x800 + (t - t1) * tile.width + (s - s1) * 2) ^ mask) & 0xFFE];
                     dstH[0] = src >> 24;
                     dstH[1] = src >> 16;
                     dstL[0] = src >>  8;
@@ -1486,18 +1677,14 @@ void RDP::setCombine()
         {
             case 0: combineA[i] = &combColor;  break;
             case 1: combineA[i] = &texelColor; break;
+            case 2: combineA[i] = &texelColor; break;
             case 3: combineA[i] = &primColor;  break;
             case 4: combineA[i] = &shadeColor; break;
             case 5: combineA[i] = &envColor;   break;
             case 6: combineA[i] = &maxColor;   break;
+            default: combineA[i] = &minColor;  break;
 
-            default:
-                if (srcA >= 8)
-                {
-                    combineA[i] = &minColor;
-                    break;
-                }
-
+            case 7:
                 LOG_WARN("Unimplemented CC cycle %d RGB source A: %d\n", i, srcA);
                 combineA[i] = &maxColor;
                 break;
@@ -1509,17 +1696,13 @@ void RDP::setCombine()
         {
             case 0: combineB[i] = &combColor;  break;
             case 1: combineB[i] = &texelColor; break;
+            case 2: combineB[i] = &texelColor; break;
             case 3: combineB[i] = &primColor;  break;
             case 4: combineB[i] = &shadeColor; break;
             case 5: combineB[i] = &envColor;   break;
+            default: combineB[i] = &minColor;  break;
 
-            default:
-                if (srcB >= 8)
-                {
-                    combineB[i] = &minColor;
-                    break;
-                }
-
+            case 6: case 7:
                 LOG_WARN("Unimplemented CC cycle %d RGB source B: %d\n", i, srcB);
                 combineB[i] = &minColor;
                 break;
@@ -1531,22 +1714,19 @@ void RDP::setCombine()
         {
             case  0: combineC[i] = &combColor;  break;
             case  1: combineC[i] = &texelColor; break;
+            case  2: combineC[i] = &texelColor; break;
             case  3: combineC[i] = &primColor;  break;
             case  4: combineC[i] = &shadeColor; break;
             case  5: combineC[i] = &envColor;   break;
             case  7: combineC[i] = &combAlpha;  break;
             case  8: combineC[i] = &texelAlpha; break;
+            case  9: combineC[i] = &texelAlpha; break;
             case 10: combineC[i] = &primAlpha;  break;
             case 11: combineC[i] = &shadeAlpha; break;
             case 12: combineC[i] = &envAlpha;   break;
+            default: combineC[i] = &minColor;   break;
 
-            default:
-                if (srcC >= 16)
-                {
-                    combineC[i] = &minColor;
-                    break;
-                }
-
+            case 6: case 13: case 14: case 15:
                 LOG_WARN("Unimplemented CC cycle %d RGB source C: %d\n", i, srcC);
                 combineC[i] = &maxColor;
                 break;
@@ -1554,20 +1734,16 @@ void RDP::setCombine()
 
         // Set the D input for color combiner RGB components
         static const uint8_t shiftsD[2] = { 15, 6 };
-        switch (uint8_t srcD = (opcode[0] >> shiftsD[i]) & 0x7)
+        switch ((opcode[0] >> shiftsD[i]) & 0x7)
         {
             case 0: combineD[i] = &combColor;  break;
             case 1: combineD[i] = &texelColor; break;
+            case 2: combineD[i] = &texelColor; break;
             case 3: combineD[i] = &primColor;  break;
             case 4: combineD[i] = &shadeColor; break;
             case 5: combineD[i] = &envColor;   break;
             case 6: combineD[i] = &maxColor;   break;
-            case 7: combineD[i] = &minColor;   break;
-
-            default:
-                LOG_WARN("Unimplemented CC cycle %d RGB source D: %d\n", i, srcD);
-                combineD[i] = &minColor;
-                break;
+            default: combineD[i] = &minColor;  break;
         }
     }
 
@@ -1575,38 +1751,30 @@ void RDP::setCombine()
     {
         // Set the A input for color combiner alpha components
         static const uint8_t shiftsA[2] = { 44, 21 };
-        switch (uint8_t srcA = (opcode[0] >> shiftsA[i - 2]) & 0x7)
+        switch ((opcode[0] >> shiftsA[i - 2]) & 0x7)
         {
             case 0: combineA[i] = &combAlpha;  break;
             case 1: combineA[i] = &texelAlpha; break;
+            case 2: combineA[i] = &texelAlpha; break;
             case 3: combineA[i] = &primAlpha;  break;
             case 4: combineA[i] = &shadeAlpha; break;
             case 5: combineA[i] = &envAlpha;   break;
             case 6: combineA[i] = &maxColor;   break;
-            case 7: combineA[i] = &minColor;   break;
-
-            default:
-                LOG_WARN("Unimplemented CC cycle %d alpha source A: %d\n", i, srcA);
-                combineA[i] = &maxColor;
-                break;
+            default: combineA[i] = &minColor;  break;
         }
 
         // Set the B input for color combiner alpha components
         static const uint8_t shiftsB[2] = { 12, 3 };
-        switch (uint8_t srcB = (opcode[0] >> shiftsB[i - 2]) & 0x7)
+        switch ((opcode[0] >> shiftsB[i - 2]) & 0x7)
         {
             case 0: combineB[i] = &combAlpha;  break;
             case 1: combineB[i] = &texelAlpha; break;
+            case 2: combineB[i] = &texelAlpha; break;
             case 3: combineB[i] = &primAlpha;  break;
             case 4: combineB[i] = &shadeAlpha; break;
             case 5: combineB[i] = &envAlpha;   break;
             case 6: combineB[i] = &maxColor;   break;
-            case 7: combineB[i] = &minColor;   break;
-
-            default:
-                LOG_WARN("Unimplemented CC cycle %d alpha source B: %d\n", i, srcB);
-                combineB[i] = &minColor;
-                break;
+            default: combineB[i] = &minColor;  break;
         }
 
         // Set the C input for color combiner alpha components
@@ -1614,12 +1782,13 @@ void RDP::setCombine()
         switch (uint8_t srcC = (opcode[0] >> shiftsC[i - 2]) & 0x7)
         {
             case 1: combineC[i] = &texelAlpha; break;
+            case 2: combineC[i] = &texelAlpha; break;
             case 3: combineC[i] = &primAlpha;  break;
             case 4: combineC[i] = &shadeAlpha; break;
             case 5: combineC[i] = &envAlpha;   break;
-            case 7: combineC[i] = &minColor;   break;
+            default: combineC[i] = &minColor;  break;
 
-            default:
+            case 0: case 6:
                 LOG_WARN("Unimplemented CC cycle %d alpha source C: %d\n", i, srcC);
                 combineC[i] = &maxColor;
                 break;
@@ -1627,20 +1796,16 @@ void RDP::setCombine()
 
         // Set the D input for color combiner alpha components
         static const uint8_t shiftsD[2] = { 9, 0 };
-        switch (uint8_t srcD = (opcode[0] >> shiftsD[i - 2]) & 0x7)
+        switch ((opcode[0] >> shiftsD[i - 2]) & 0x7)
         {
             case 0: combineD[i] = &combAlpha;  break;
             case 1: combineD[i] = &texelAlpha; break;
+            case 2: combineD[i] = &texelAlpha; break;
             case 3: combineD[i] = &primAlpha;  break;
             case 4: combineD[i] = &shadeAlpha; break;
             case 5: combineD[i] = &envAlpha;   break;
             case 6: combineD[i] = &maxColor;   break;
-            case 7: combineD[i] = &minColor;   break;
-
-            default:
-                LOG_WARN("Unimplemented CC cycle %d alpha source D: %d\n", i, srcD);
-                combineD[i] = &minColor;
-                break;
+            default: combineD[i] = &minColor;  break;
         }
     }
 }

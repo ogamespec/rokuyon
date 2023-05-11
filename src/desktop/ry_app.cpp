@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -17,9 +17,13 @@
     along with rokuyon. If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include <wx/filename.h>
+#include <wx/stdpaths.h>
+
 #include "ry_app.h"
-#include "../core.h"
 #include "../ai.h"
+#include "../core.h"
+#include "../settings.h"
 
 enum AppEvent
 {
@@ -30,8 +34,61 @@ wxBEGIN_EVENT_TABLE(ryApp, wxApp)
 EVT_TIMER(UPDATE, ryApp::update)
 wxEND_EVENT_TABLE()
 
+int ryApp::keyBinds[] =
+{
+    'L', 'K', 'J', 'G', // A, B, Z, Start
+    WXK_UP, WXK_DOWN, WXK_LEFT, WXK_RIGHT, // D-pad
+    'Q', 'P', // L, R
+    '8', 'I', 'U', 'O', // C-buttons
+    'W', 'S', 'A', 'D', WXK_SHIFT // Joystick
+};
+
 bool ryApp::OnInit()
 {
+    // Define the input binding settings
+    Settings::add("keyA", &keyBinds[0], false);
+    Settings::add("keyB", &keyBinds[1], false);
+    Settings::add("keyZ", &keyBinds[2], false);
+    Settings::add("keyStart", &keyBinds[3], false);
+    Settings::add("keyDUp", &keyBinds[4], false);
+    Settings::add("keyDDown", &keyBinds[5], false);
+    Settings::add("keyDLeft", &keyBinds[6], false);
+    Settings::add("keyDRight", &keyBinds[7], false);
+    Settings::add("keyL", &keyBinds[8], false);
+    Settings::add("keyR", &keyBinds[9], false);
+    Settings::add("keyCUp", &keyBinds[10], false);
+    Settings::add("keyCDown", &keyBinds[11], false);
+    Settings::add("keyCLeft", &keyBinds[12], false);
+    Settings::add("keyCRight", &keyBinds[13], false);
+    Settings::add("keySUp", &keyBinds[14], false);
+    Settings::add("keySDown", &keyBinds[15], false);
+    Settings::add("keySLeft", &keyBinds[16], false);
+    Settings::add("keySRight", &keyBinds[17], false);
+    Settings::add("keySMod", &keyBinds[18], false);
+
+    // Try to load settings from the current directory first
+    if (!Settings::load())
+    {
+        // Get the system-specific application settings directory
+        std::string settingsDir;
+        wxStandardPaths &paths = wxStandardPaths::Get();
+#if defined(WINDOWS) || defined(MACOS) || !wxCHECK_VERSION(3, 1, 0)
+        settingsDir = paths.GetUserDataDir().mb_str(wxConvUTF8);
+#else
+        paths.SetFileLayout(wxStandardPaths::FileLayout_XDG);
+        settingsDir = paths.GetUserConfigDir().mb_str(wxConvUTF8);
+        settingsDir += "/rokuyon";
+#endif
+
+        // Try to load settings from the system directory, creating it if it doesn't exist
+        if (!Settings::load(settingsDir + "/rokuyon.ini"))
+        {
+            wxFileName dir = wxFileName::DirName(settingsDir);
+            if (!dir.DirExists()) dir.Mkdir();
+            Settings::save();
+        }
+    }
+
     // Create the app's frame, passing along a filename from the command line
     SetAppName("rokuyon");
     frame = new ryFrame((argc > 1) ? argv[1].ToStdString() : "");

@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -24,6 +24,8 @@
 
 struct _Framebuffer
 {
+    ~_Framebuffer() { delete[] data; }
+
     uint32_t *data;
     uint32_t width;
     uint32_t height;

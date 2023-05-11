@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -33,6 +33,7 @@ namespace CPU_CP0
     void resetCycles();
     void checkInterrupts();
     void exception(uint8_t type);
+    void setTlbAddress(uint32_t address);
     bool cpUsable(uint8_t cp);
 }
 

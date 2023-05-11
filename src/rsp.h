@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -20,7 +20,7 @@
 #ifndef RSP_H
 #define RSP_H
 
-#include <string>
+#include <cstdint>
 
 namespace RSP
 {

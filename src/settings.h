@@ -17,31 +17,20 @@
     along with rokuyon. If not, see <https://www.gnu.org/licenses/>.
 */
 
-#ifndef SAVE_DIALOG_H
-#define SAVE_DIALOG_H
+#ifndef SETTINGS_H
+#define SETTINGS_H
 
-#include <cstdint>
-#include <wx/wx.h>
+#include <string>
 
-class SaveDialog: public wxDialog
+namespace Settings
 {
-    public:
-        SaveDialog(std::string &lastPath);
+    void add(std::string name, void *value, bool isString);
+    bool load(std::string filename = "rokuyon.ini");
+    bool save();
 
-    private:
-        std::string &lastPath;
-        uint32_t selection = 0;
+    extern int fpsLimiter;
+    extern int threadedRdp;
+    extern int texFilter;
+}
 
-        uint32_t selectToSize(uint32_t select);
-        uint32_t sizeToSelect(uint32_t size);
-
-        void select0(wxCommandEvent &event);
-        void select1(wxCommandEvent &event);
-        void select2(wxCommandEvent &event);
-        void select3(wxCommandEvent &event);
-        void confirm(wxCommandEvent &event);
-
-        wxDECLARE_EVENT_TABLE();
-};
-
-#endif // SAVE_DIALOG_H
+#endif // SETTINGS_H

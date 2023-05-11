@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -20,7 +20,9 @@
 #ifndef RY_FRAME_H
 #define RY_FRAME_H
 
+#include <vector>
 #include <wx/wx.h>
+#include <wx/joystick.h>
 
 class ryCanvas;
 
@@ -32,16 +34,24 @@ class ryFrame: public wxFrame
         void Refresh();
         bool isPaused() { return paused; }
 
+        void pressKey(int key);
+        void releaseKey(int key);
+
     private:
         ryCanvas *canvas;
         wxMenu *fileMenu;
         wxMenu *systemMenu;
+        wxJoystick *joystick;
+        wxTimer *timer;
 
         std::string lastPath;
-        bool paused;
+        bool paused = false;
+        std::vector<int> axisBases;
+        bool stickPressed[5] = {};
 
         void bootRom(std::string path);
         void updateMenu();
+        void updateKeyStick();
 
         void loadRom(wxCommandEvent &event);
         void changeSave(wxCommandEvent &event);
@@ -49,6 +59,11 @@ class ryFrame: public wxFrame
         void pause(wxCommandEvent &event);
         void restart(wxCommandEvent &event);
         void stop(wxCommandEvent &event);
+        void inputSettings(wxCommandEvent &event);
+        void toggleFpsLimit(wxCommandEvent &event);
+        void toggleThreadRdp(wxCommandEvent &event);
+        void toggleTexFilter(wxCommandEvent &event);
+        void updateJoystick(wxTimerEvent &event);
         void dropFiles(wxDropFilesEvent &event);
         void close(wxCloseEvent &event);
 

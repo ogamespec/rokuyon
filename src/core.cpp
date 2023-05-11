@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -213,6 +213,7 @@ void Core::stop()
         saveThread->join();
         delete emuThread;
         delete saveThread;
+        RDP::finishThread();
     }
 }
 

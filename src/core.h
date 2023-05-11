@@ -1,5 +1,5 @@
 /*
-    Copyright 2022 Hydr8gon
+    Copyright 2022-2023 Hydr8gon
 
     This file is part of rokuyon.
 
@@ -20,6 +20,7 @@
 #ifndef CORE_H
 #define CORE_H
 
+#include <cstdint>
 #include <string>
 
 namespace Core
