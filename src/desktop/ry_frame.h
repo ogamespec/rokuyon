@@ -24,6 +24,8 @@
 #include <wx/wx.h>
 #include <wx/joystick.h>
 
+#define MIN_SIZE wxSize(480, 360)
+
 class ryCanvas;
 
 class ryFrame: public wxFrame
@@ -61,6 +63,7 @@ class ryFrame: public wxFrame
         void stop(wxCommandEvent &event);
         void inputSettings(wxCommandEvent &event);
         void toggleFpsLimit(wxCommandEvent &event);
+        void toggleExpanPak(wxCommandEvent &event);
         void toggleThreadRdp(wxCommandEvent &event);
         void toggleTexFilter(wxCommandEvent &event);
         void updateJoystick(wxTimerEvent &event);
